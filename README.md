@@ -1,16 +1,39 @@
 # baish
 
-`baish` is a fork of GNU Bash (based on bash 5.3 sources) with an integrated OpenAI-compatible chatbot builtin.
+`baish` is a fork of GNU Bash (based on Bash 5.3 sources) with an integrated OpenAI-compatible chatbot builtin.
 
-## Build
+It adds an `ask` builtin (and `?{...}` sugar) that calls an OpenAI-compatible API to answer questions and optionally suggest shell commands.
+
+## Build / run / test
+
+Preferred (top-level Makefile):
+
+```bash
+make build
+make run RUN_ARGS='-c "echo hello"'
+make test
+```
+
+Manual (bash build system):
 
 ```bash
 cd bash-source
 ./configure
 make -j4
+make tests
 ```
 
 The resulting shell binary is `bash-source/baish`.
+
+## Install
+
+The top-level Makefile installs the built binary into `$(PREFIX)/bin` (default: `~/.local/bin`):
+
+```bash
+make install
+# or
+make install PREFIX=/usr/local
+```
 
 ## AI configuration (environment variables)
 
@@ -31,7 +54,7 @@ Optional:
 
 If no port is provided, `baish` will try common HTTP ports (currently `80`, then `8000`).
 
-## Usage
+## Using the LLM
 
 ### `ask` builtin
 
@@ -70,6 +93,16 @@ export BAISH_MODEL=gpt-4o-mini
 
 ./bash-source/baish -c '?{what is 2+2?}'
 ./bash-source/baish -c 'ask "give me a one-liner to show disk usage by directory"'
+```
+
+Interactive example:
+
+```bash
+export BAISH_OPENAI_BASE_URL=puck.local
+export BAISH_MODEL=gpt-4o-mini
+
+./bash-source/baish
+ask "write a safe command to list the 20 largest files under the current directory"
 ```
 
 If your server is running on a non-default port:
