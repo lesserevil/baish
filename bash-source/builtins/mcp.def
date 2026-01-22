@@ -72,7 +72,7 @@ write_callback(void *contents, size_t size, size_t nmemb, void *userp)
   
   char *ptr = realloc(resp->data, resp->size + realsize + 1);
   if (ptr == NULL) {
-    /* Out of memory */
+    /* Out of memory - data will be freed by caller */
     return 0;
   }
   
@@ -100,6 +100,10 @@ mcp_connect(const char *servername)
   }
   
   response.data = malloc(1);
+  if (response.data == NULL) {
+    builtin_error(_("out of memory"));
+    return EXECUTION_FAILURE;
+  }
   response.size = 0;
   
   /* Initialize curl */
@@ -148,6 +152,10 @@ mcp_connect(const char *servername)
     free(mcp_current_server);
   }
   mcp_current_server = strdup(servername);
+  if (mcp_current_server == NULL) {
+    builtin_error(_("out of memory"));
+    return EXECUTION_FAILURE;
+  }
   mcp_connected = 1;
   
   printf(_("Connected to MCP server: %s\n"), servername);
@@ -188,6 +196,10 @@ mcp_list(void)
   }
   
   response.data = malloc(1);
+  if (response.data == NULL) {
+    builtin_error(_("out of memory"));
+    return EXECUTION_FAILURE;
+  }
   response.size = 0;
   
   curl = curl_easy_init();
