@@ -38,7 +38,7 @@ $SHORT_DOC ask [question...]
 Ask the configured model a question; optionally execute returned shell commands.
 
 Configuration variables:
-  BAISH_OPENAI_BASE_URL  Host or base URL (e.g. puck.local, puck.local:8000, http://puck.local/v1)
+  BAISH_OPENAI_BASE_URL  Host or base URL (e.g. llm-host, llm-host:8000, http://llm-host/v1)
   BAISH_OPENAI_PORT      Optional port override (ignored if BAISH_OPENAI_BASE_URL includes an explicit port)
   BAISH_MODEL            Model name
   BAISH_AUTOEXEC         If set (non-zero), execute returned commands without prompting
