@@ -452,6 +452,393 @@ baish_parse_http_base_url (const char *base, char **hostp, char **portp, char **
   return 1;
 }
 
+typedef struct
+{
+  int fd;
+  char *host;
+  char *port;
+} baish_http_conn;
+
+static baish_http_conn baish_http_cached_conn = { -1, 0, 0 };
+
+static void
+baish_http_cache_clear (void)
+{
+  if (baish_http_cached_conn.fd >= 0)
+    close (baish_http_cached_conn.fd);
+  baish_http_cached_conn.fd = -1;
+  if (baish_http_cached_conn.host)
+    free (baish_http_cached_conn.host);
+  if (baish_http_cached_conn.port)
+    free (baish_http_cached_conn.port);
+  baish_http_cached_conn.host = 0;
+  baish_http_cached_conn.port = 0;
+}
+
+static int
+baish_http_cache_match (const char *host, const char *port)
+{
+  if (baish_http_cached_conn.fd < 0)
+    return 0;
+  if (host == 0 || port == 0)
+    return 0;
+  if (baish_http_cached_conn.host == 0 || baish_http_cached_conn.port == 0)
+    return 0;
+  return (STREQ (host, baish_http_cached_conn.host) && STREQ (port, baish_http_cached_conn.port));
+}
+
+static void
+baish_http_cache_set (int fd, const char *host, const char *port)
+{
+  if (baish_http_cached_conn.fd >= 0 && baish_http_cached_conn.fd != fd)
+    close (baish_http_cached_conn.fd);
+  if (baish_http_cached_conn.host)
+    free (baish_http_cached_conn.host);
+  if (baish_http_cached_conn.port)
+    free (baish_http_cached_conn.port);
+  baish_http_cached_conn.fd = fd;
+  baish_http_cached_conn.host = host ? savestring (host) : 0;
+  baish_http_cached_conn.port = port ? savestring (port) : 0;
+}
+
+static int
+baish_http_connect (const char *host, const char *port, int *using_cached)
+{
+  struct addrinfo hints, *res, *rp;
+  int sfd;
+  int ga;
+  int timeout_sec;
+
+  if (using_cached)
+    *using_cached = 0;
+
+  if (host == 0 || port == 0)
+    return -1;
+
+  if (baish_http_cache_match (host, port))
+    {
+      if (using_cached)
+        *using_cached = 1;
+      baish_diag ("reusing connection to %s:%s", host ? host : "", port ? port : "");
+      return baish_http_cached_conn.fd;
+    }
+
+  if (baish_http_cached_conn.fd >= 0)
+    baish_http_cache_clear ();
+
+  memset (&hints, 0, sizeof (hints));
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+
+  baish_diag ("resolving %s:%s", host ? host : "", port ? port : "");
+
+  ga = getaddrinfo (host, port, &hints, &res);
+  if (ga != 0)
+    {
+      baish_set_transport_error ("getaddrinfo(%s:%s): %s", host ? host : "", port ? port : "", gai_strerror (ga));
+      return -1;
+    }
+
+  sfd = -1;
+  for (rp = res; rp; rp = rp->ai_next)
+    {
+      sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if (sfd < 0)
+        continue;
+
+      timeout_sec = baish_http_timeout_seconds ();
+      {
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt (sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+        setsockopt (sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+      }
+
+      baish_diag ("connecting to %s:%s", host ? host : "", port ? port : "");
+      if (connect (sfd, rp->ai_addr, rp->ai_addrlen) == 0)
+        break;
+      baish_set_transport_error ("connect(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
+      close (sfd);
+      sfd = -1;
+    }
+  freeaddrinfo (res);
+  return sfd;
+}
+
+static long
+baish_http_content_length (const char *headers)
+{
+  const char *p;
+  char *endp;
+  long v;
+
+  if (headers == 0)
+    return -1;
+  p = baish_strcasestr (headers, "Content-Length:");
+  if (p == 0)
+    return -1;
+  p = strchr (p, ':');
+  if (p == 0)
+    return -1;
+  p++;
+  p = baish_skip_ws (p);
+  if (*p == 0)
+    return -1;
+  v = strtol (p, &endp, 10);
+  if (endp == p || v < 0)
+    return -1;
+  return v;
+}
+
+static char *
+baish_http_read_response (int sfd, const char *host, const char *port, int *keep_alive)
+{
+  char *resp;
+  size_t cap, len;
+  ssize_t n;
+  char *header_end;
+  size_t header_len;
+  long content_len;
+  int have_header;
+  int close_conn;
+  int chunked;
+
+  cap = 8192;
+  len = 0;
+  resp = (char *)xmalloc (cap);
+  header_end = 0;
+  header_len = 0;
+  content_len = -1;
+  have_header = 0;
+  close_conn = 0;
+  chunked = 0;
+
+  while (1)
+    {
+      if (len + 4096 >= cap)
+        {
+          cap *= 2;
+          resp = (char *)xrealloc (resp, cap);
+        }
+      n = read (sfd, resp + len, cap - len - 1);
+      if (n > 0)
+        {
+          len += (size_t)n;
+          resp[len] = '\0';
+          if (have_header == 0)
+            {
+              header_end = strstr (resp, "\r\n\r\n");
+              if (header_end)
+                {
+                  char *headers;
+                  header_len = (size_t)(header_end - resp);
+                  headers = (char *)xmalloc (header_len + 1);
+                  memcpy (headers, resp, header_len);
+                  headers[header_len] = '\0';
+                  content_len = baish_http_content_length (headers);
+                  close_conn = (baish_strcasestr (headers, "Connection: close") != 0);
+                  chunked = (baish_strcasestr (headers, "Transfer-Encoding: chunked") != 0);
+                  free (headers);
+                  have_header = 1;
+                }
+            }
+
+          if (have_header && content_len >= 0)
+            {
+              size_t total = header_len + 4 + (size_t)content_len;
+              if (len >= total)
+                break;
+            }
+          continue;
+        }
+      if (n == 0)
+        break;
+      baish_set_transport_error ("read(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
+      free (resp);
+      return 0;
+    }
+
+  if (have_header == 0)
+    {
+      baish_set_transport_error ("read(%s:%s): malformed HTTP response", host ? host : "", port ? port : "");
+      free (resp);
+      return 0;
+    }
+
+  if (content_len >= 0)
+    {
+      size_t total = header_len + 4 + (size_t)content_len;
+      if (len < total)
+        {
+          baish_set_transport_error ("read(%s:%s): unexpected EOF", host ? host : "", port ? port : "");
+          free (resp);
+          return 0;
+        }
+    }
+
+  if (keep_alive)
+    {
+      if (content_len >= 0 && close_conn == 0 && chunked == 0)
+        *keep_alive = 1;
+      else
+        *keep_alive = 0;
+    }
+
+  resp[len] = '\0';
+  return resp;
+}
+
+static char *
+baish_http_request (const char *method, const char *host, const char *port, const char *path,
+                    const char *auth_bearer, const char *body, int allow_cache_store)
+{
+  int attempt;
+  int using_cached;
+
+  for (attempt = 0; attempt < 2; attempt++)
+    {
+      int sfd;
+      char *req;
+      size_t reqlen;
+      size_t bodylen;
+      ssize_t n;
+      char *resp;
+      int keep_alive;
+
+      using_cached = 0;
+      sfd = baish_http_connect (host, port, &using_cached);
+      if (sfd < 0)
+        return 0;
+
+      bodylen = body ? strlen (body) : 0;
+      if (body)
+        {
+          if (auth_bearer && *auth_bearer)
+            {
+              reqlen = bodylen + strlen (host) + strlen (path) + strlen (auth_bearer) + 256;
+              req = (char *)xmalloc (reqlen);
+              snprintf (req, reqlen,
+                        "%s %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Authorization: Bearer %s\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Content-Length: %lu\r\n"
+                        "\r\n"
+                        "%s",
+                        method, path, host, auth_bearer, (unsigned long)bodylen, body);
+            }
+          else
+            {
+              reqlen = bodylen + strlen (host) + strlen (path) + 192;
+              req = (char *)xmalloc (reqlen);
+              snprintf (req, reqlen,
+                        "%s %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Content-Length: %lu\r\n"
+                        "\r\n"
+                        "%s",
+                        method, path, host, (unsigned long)bodylen, body);
+            }
+        }
+      else
+        {
+          if (auth_bearer && *auth_bearer)
+            {
+              reqlen = strlen (host) + strlen (path) + strlen (auth_bearer) + 128;
+              req = (char *)xmalloc (reqlen);
+              snprintf (req, reqlen,
+                        "%s %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Authorization: Bearer %s\r\n"
+                        "Connection: keep-alive\r\n"
+                        "\r\n",
+                        method, path, host, auth_bearer);
+            }
+          else
+            {
+              reqlen = strlen (host) + strlen (path) + 96;
+              req = (char *)xmalloc (reqlen);
+              snprintf (req, reqlen,
+                        "%s %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Connection: keep-alive\r\n"
+                        "\r\n",
+                        method, path, host);
+            }
+        }
+
+      {
+        const char *p = req;
+        size_t left = strlen (req);
+        while (left)
+          {
+            n = write (sfd, p, left);
+            if (n <= 0)
+              {
+                baish_set_transport_error ("write(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
+                free (req);
+                if (using_cached)
+                  baish_http_cache_clear ();
+                else
+                  close (sfd);
+                sfd = -1;
+                break;
+              }
+            p += n;
+            left -= (size_t)n;
+          }
+      }
+      free (req);
+
+      if (sfd < 0)
+        {
+          if (using_cached)
+            continue;
+          return 0;
+        }
+
+      keep_alive = 0;
+      resp = baish_http_read_response (sfd, host, port, &keep_alive);
+      if (resp == 0)
+        {
+          if (using_cached)
+            {
+              baish_http_cache_clear ();
+              continue;
+            }
+          close (sfd);
+          return 0;
+        }
+
+      if (keep_alive)
+        {
+          if (using_cached)
+            {
+              return resp;
+            }
+          if (allow_cache_store)
+            {
+              baish_http_cache_set (sfd, host, port);
+              return resp;
+            }
+          close (sfd);
+          return resp;
+        }
+
+      if (using_cached)
+        baish_http_cache_clear ();
+      else
+        close (sfd);
+      return resp;
+    }
+
+  return 0;
+}
+
 static char *
 baish_http_post (const char *host, const char *port, const char *path, const char *auth_bearer, const char *body);
 
@@ -556,261 +943,13 @@ baish_http_get_try_ports (const char *host, const char *port, const char *path, 
 static char *
 baish_http_get (const char *host, const char *port, const char *path, const char *auth_bearer)
 {
-  struct addrinfo hints, *res, *rp;
-  int sfd;
-  int ga;
-  int timeout_sec;
-  char *req;
-  size_t reqlen;
-  char *resp;
-  size_t cap, len;
-  ssize_t n;
-
-  memset (&hints, 0, sizeof (hints));
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_family = AF_UNSPEC;
-
-  baish_diag ("resolving %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
-
-  ga = getaddrinfo (host, port, &hints, &res);
-  if (ga != 0)
-    {
-      baish_set_transport_error ("getaddrinfo(%s:%s): %s", host ? host : "", port ? port : "", gai_strerror (ga));
-      return 0;
-    }
-
-  sfd = -1;
-  for (rp = res; rp; rp = rp->ai_next)
-    {
-      sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-      if (sfd < 0)
-        continue;
-
-      timeout_sec = baish_http_timeout_seconds ();
-      {
-        struct timeval tv;
-        tv.tv_sec = timeout_sec;
-        tv.tv_usec = 0;
-        setsockopt (sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
-        setsockopt (sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
-      }
-
-      baish_diag ("connecting to %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
-      if (connect (sfd, rp->ai_addr, rp->ai_addrlen) == 0)
-        break;
-      baish_set_transport_error ("connect(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-      close (sfd);
-      sfd = -1;
-    }
-  freeaddrinfo (res);
-  if (sfd < 0)
-    return 0;
-
-  if (auth_bearer && *auth_bearer)
-    {
-      reqlen = strlen (host) + strlen (path) + strlen (auth_bearer) + 128;
-      req = (char *)xmalloc (reqlen);
-      snprintf (req, reqlen,
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Authorization: Bearer %s\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                path, host, auth_bearer);
-    }
-  else
-    {
-      reqlen = strlen (host) + strlen (path) + 96;
-      req = (char *)xmalloc (reqlen);
-      snprintf (req, reqlen,
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                path, host);
-    }
-
-  {
-    const char *p = req;
-    size_t left = strlen (req);
-    while (left)
-      {
-        n = write (sfd, p, left);
-        if (n <= 0)
-          {
-            baish_set_transport_error ("write(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-            free (req);
-            close (sfd);
-            return 0;
-          }
-        p += n;
-        left -= (size_t)n;
-      }
-  }
-  free (req);
-
-  cap = 8192;
-  len = 0;
-  resp = (char *)xmalloc (cap);
-
-  while (1)
-    {
-      n = read (sfd, resp + len, cap - len - 1);
-      if (n > 0)
-        {
-          len += (size_t)n;
-          if (len + 4096 >= cap)
-            {
-              cap *= 2;
-              resp = (char *)xrealloc (resp, cap);
-            }
-          continue;
-        }
-      if (n == 0)
-        break;
-      baish_set_transport_error ("read(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-      free (resp);
-      close (sfd);
-      return 0;
-    }
-
-  close (sfd);
-  resp[len] = '\0';
-  return resp;
+  return baish_http_request ("GET", host, port, path, auth_bearer, 0, 0);
 }
 
 static char *
 baish_http_post (const char *host, const char *port, const char *path, const char *auth_bearer, const char *body)
 {
-  struct addrinfo hints, *res, *rp;
-  int sfd;
-  int ga;
-  int timeout_sec;
-  size_t bodylen;
-  char *req;
-  size_t reqlen;
-  char *resp;
-  size_t cap, len;
-  ssize_t n;
-
-  memset (&hints, 0, sizeof (hints));
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_family = AF_UNSPEC;
-
-  baish_diag ("resolving %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
-
-  ga = getaddrinfo (host, port, &hints, &res);
-  if (ga != 0)
-    {
-      baish_set_transport_error ("getaddrinfo(%s:%s): %s", host ? host : "", port ? port : "", gai_strerror (ga));
-      return 0;
-    }
-
-  sfd = -1;
-  for (rp = res; rp; rp = rp->ai_next)
-    {
-      sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-      if (sfd < 0)
-        continue;
-
-      timeout_sec = baish_http_timeout_seconds ();
-      {
-        struct timeval tv;
-        tv.tv_sec = timeout_sec;
-        tv.tv_usec = 0;
-        setsockopt (sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
-        setsockopt (sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
-      }
-
-      baish_diag ("connecting to %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
-      if (connect (sfd, rp->ai_addr, rp->ai_addrlen) == 0)
-        break;
-      baish_set_transport_error ("connect(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-      close (sfd);
-      sfd = -1;
-    }
-  freeaddrinfo (res);
-  if (sfd < 0)
-    return 0;
-
-  bodylen = body ? strlen (body) : 0;
-  if (auth_bearer && *auth_bearer)
-    {
-      reqlen = bodylen + strlen (host) + strlen (path) + strlen (auth_bearer) + 256;
-      req = (char *)xmalloc (reqlen);
-      snprintf (req, reqlen,
-                "POST %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Content-Type: application/json\r\n"
-                "Authorization: Bearer %s\r\n"
-                "Connection: close\r\n"
-                "Content-Length: %lu\r\n"
-                "\r\n"
-                "%s",
-                path, host, auth_bearer, (unsigned long)bodylen, body ? body : "");
-    }
-  else
-    {
-      reqlen = bodylen + strlen (host) + strlen (path) + 192;
-      req = (char *)xmalloc (reqlen);
-      snprintf (req, reqlen,
-                "POST %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Content-Type: application/json\r\n"
-                "Connection: close\r\n"
-                "Content-Length: %lu\r\n"
-                "\r\n"
-                "%s",
-                path, host, (unsigned long)bodylen, body ? body : "");
-    }
-
-  {
-    const char *p = req;
-    size_t left = strlen (req);
-    while (left)
-      {
-        n = write (sfd, p, left);
-        if (n <= 0)
-          {
-            baish_set_transport_error ("write(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-            free (req);
-            close (sfd);
-            return 0;
-          }
-        p += n;
-        left -= (size_t)n;
-      }
-  }
-  free (req);
-
-  cap = 8192;
-  len = 0;
-  resp = (char *)xmalloc (cap);
-
-  while (1)
-    {
-      n = read (sfd, resp + len, cap - len - 1);
-      if (n > 0)
-        {
-          len += (size_t)n;
-          if (len + 4096 >= cap)
-            {
-              cap *= 2;
-              resp = (char *)xrealloc (resp, cap);
-            }
-          continue;
-        }
-      if (n == 0)
-        break;
-      baish_set_transport_error ("read(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
-      free (resp);
-      close (sfd);
-      return 0;
-    }
-
-  close (sfd);
-  resp[len] = '\0';
-  return resp;
+  return baish_http_request ("POST", host, port, path, auth_bearer, body, 1);
 }
 
 static char *
@@ -1077,6 +1216,143 @@ baish_extract_message_content (const char *json)
     return 0;
 
   return baish_json_parse_string (&p);
+}
+
+static char *
+baish_extract_response_output_text (const char *json)
+{
+  const char *p;
+
+  if (json == 0)
+    return 0;
+
+  p = strstr (json, "\"output_text\"");
+  if (p)
+    {
+      p = strchr (p, ':');
+      if (p)
+        {
+          p++;
+          p = baish_skip_ws (p);
+          if (*p == '"')
+            return baish_json_parse_string (&p);
+        }
+    }
+
+  p = json;
+  while ((p = strstr (p, "\"type\"")) != 0)
+    {
+      const char *q;
+      char *type;
+
+      q = strchr (p, ':');
+      if (q == 0)
+        break;
+      q++;
+      q = baish_skip_ws (q);
+      if (*q != '"')
+        {
+          p = q;
+          continue;
+        }
+      type = baish_json_parse_string (&q);
+      if (type)
+        {
+          if (STREQ (type, "output_text"))
+            {
+              const char *t;
+              free (type);
+              t = strstr (q, "\"text\"");
+              if (t)
+                {
+                  t = strchr (t, ':');
+                  if (t)
+                    {
+                      t++;
+                      t = baish_skip_ws (t);
+                      if (*t == '"')
+                        return baish_json_parse_string (&t);
+                    }
+                }
+            }
+          else
+            free (type);
+        }
+      p = q;
+    }
+
+  return 0;
+}
+
+static char *
+baish_extract_response_text (const char *json)
+{
+  char *out;
+
+  out = baish_extract_response_output_text (json);
+  if (out)
+    return out;
+  return baish_extract_message_content (json);
+}
+
+static char *
+baish_strip_think_blocks (const char *s)
+{
+  const char *open = "<think>";
+  const char *close = "</think>";
+  const char *p;
+  const char *start;
+  const char *last_close;
+  char *out;
+  size_t o;
+
+  if (s == 0)
+    return 0;
+
+  start = s;
+  last_close = 0;
+  p = s;
+  while ((p = strstr (p, close)) != 0)
+    {
+      last_close = p;
+      p += strlen (close);
+    }
+  if (last_close)
+    start = last_close + strlen (close);
+
+  out = (char *)xmalloc (strlen (start) + 1);
+  o = 0;
+  p = start;
+
+  while (*p)
+    {
+      const char *t;
+      const char *e;
+
+      t = strstr (p, open);
+      if (t == 0)
+        {
+          size_t n = strlen (p);
+          memcpy (out + o, p, n);
+          o += n;
+          break;
+        }
+
+      if (t > p)
+        {
+          size_t n = t - p;
+          memcpy (out + o, p, n);
+          o += n;
+        }
+
+      e = strstr (t + strlen (open), close);
+      if (e == 0)
+        break;
+      p = e + strlen (close);
+    }
+
+  out[o] = '\0';
+  return out;
 }
 
 static int
@@ -1437,7 +1713,7 @@ ask_builtin (WORD_LIST *list)
       port = savestring (port_override);
     }
 
-  path = baish_join_api_path (base_path, "/chat/completions");
+  path = baish_join_api_path (base_path, "/responses");
   models_path = baish_join_api_path (base_path, "/models");
 
   interactive_notice = (json_only == 0) ? baish_notice_enabled () : 0;
@@ -1653,15 +1929,30 @@ ask_builtin (WORD_LIST *list)
     }
 
   escaped = baish_json_escape (question);
-  body = (char *)xmalloc (strlen (escaped) + strlen (model) + strlen (os_type) + strlen (cpu_arch) + 1024);
+  body = (char *)xmalloc (strlen (escaped) + strlen (model) + strlen (os_type) + strlen (cpu_arch) + 2048);
   sprintf (body,
            "{"
            "\"model\":\"%s\","
-           "\"stream\":false,"
-           "\"messages\":["
-           "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Reply with strict JSON only: {\\\"answer\\\":string,\\\"commands\\\":[string,...]}. Provide bash commands in the commands array; otherwise commands should be []. Do not include any other text.\"},"
+           "\"input\":["
+           "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Respond with JSON that matches the schema.\"},"
            "{\"role\":\"user\",\"content\":\"%s\"}"
-           "]"
+           "],"
+           "\"text\":{"
+           "\"format\":{"
+           "\"type\":\"json_schema\","
+           "\"name\":\"baish_answer\","
+           "\"strict\":true,"
+           "\"schema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{"
+           "\"answer\":{\"type\":\"string\"},"
+           "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+           "},"
+           "\"required\":[\"answer\",\"commands\"],"
+           "\"additionalProperties\":false"
+           "}"
+           "}"
+           "}"
            "}",
            model, os_type, cpu_arch, escaped);
 
@@ -1809,7 +2100,7 @@ ask_builtin (WORD_LIST *list)
       }
   }
 
-  content = baish_extract_message_content (json);
+  content = baish_extract_response_text (json);
   free (json);
   if (content == 0)
     {
@@ -1825,6 +2116,13 @@ ask_builtin (WORD_LIST *list)
       baish_free_string_list (models, nmodels);
       return (EXECUTION_FAILURE);
     }
+
+  {
+    char *sanitized;
+    sanitized = baish_strip_think_blocks (content);
+    free (content);
+    content = sanitized;
+  }
 
   if (json_only)
     {
