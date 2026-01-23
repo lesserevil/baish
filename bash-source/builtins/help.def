@@ -31,7 +31,7 @@ specified, gives detailed help on all commands matching PATTERN,
 otherwise the list of help topics is printed.
 
 Baish extensions:
-  ask [question...]     Ask the configured LLM a question (see `help ask`)
+  ask [-c] [-j] [question...]  Ask the configured LLM a question (see `help ask`)
   ?{question}           Syntax sugar for: ask "question"
 
 Options:

@@ -60,6 +60,8 @@ If no port is provided, `baish` will try common HTTP ports (currently `80`, then
 
 ```bash
 ask "how do I list files by size?"
+ask -c "show me the 10 largest files"
+ask -j "emit JSON only for this question"
 ```
 
 The model is instructed to return JSON of the form:
@@ -69,8 +71,9 @@ The model is instructed to return JSON of the form:
 ```
 
 If `commands` are returned:
-- interactive shell: `baish` will prompt before executing unless `BAISH_AUTOEXEC` is set
-- non-interactive (`-c`): commands are never auto-executed
+- default: `baish` prints the commands as a list and does not execute them
+- `ask -c`: execute returned commands without prompting (same as `BAISH_AUTOEXEC=1` for the invocation)
+- `ask -j`: print the raw JSON response only and do not execute anything
 
 Useful result variables:
 
