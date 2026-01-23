@@ -239,7 +239,13 @@ baish_sanitize_preview (const char *s, int max)
 static int
 baish_notice_enabled (void)
 {
-  return (interactive_shell && isatty (fileno (stderr)));
+  const char *v;
+
+  if (interactive_shell == 0 || isatty (fileno (stderr)) == 0)
+    return 0;
+
+  v = get_string_value ("BAISH_ASK_NOTICE");
+  return baish_truthy (v);
 }
 
 static void
@@ -1484,6 +1490,64 @@ baish_strip_think_blocks (const char *s)
   return out;
 }
 
+static char *
+baish_slice_json_object (const char *s)
+{
+  const char *p;
+  int depth;
+  int in_string;
+  int escape;
+
+  if (s == 0 || *s == 0)
+    return 0;
+
+  p = s;
+  depth = 0;
+  in_string = 0;
+  escape = 0;
+
+  for (; *p; p++)
+    {
+      unsigned char c = (unsigned char)*p;
+
+      if (in_string)
+        {
+          if (escape)
+            escape = 0;
+          else if (c == '\\')
+            escape = 1;
+          else if (c == '"')
+            in_string = 0;
+          continue;
+        }
+
+      if (c == '"')
+        {
+          in_string = 1;
+          continue;
+        }
+      if (c == '{')
+        depth++;
+      else if (c == '}')
+        {
+          depth--;
+          if (depth == 0)
+            {
+              size_t len;
+              char *out;
+
+              len = (size_t)(p - s) + 1;
+              out = (char *)xmalloc (len + 1);
+              memcpy (out, s, len);
+              out[len] = '\0';
+              return out;
+            }
+        }
+    }
+
+  return 0;
+}
+
 static int
 baish_try_parse_answer_commands (const char *s, char **answerp, char ***cmdsp, int *ncmdsp)
 {
@@ -1571,10 +1635,25 @@ baish_parse_answer_commands (const char *s, char **answerp, char ***cmdsp, int *
   if (s == 0)
     return 0;
 
+  if (baish_try_parse_answer_commands (s, answerp, cmdsp, ncmdsp))
+    return 1;
+
   p = s;
   while ((p = strchr (p, '{')) != 0)
     {
-      if (baish_try_parse_answer_commands (p, answerp, cmdsp, ncmdsp))
+      char *slice;
+
+      slice = baish_slice_json_object (p);
+      if (slice)
+        {
+          if (baish_try_parse_answer_commands (slice, answerp, cmdsp, ncmdsp))
+            {
+              free (slice);
+              return 1;
+            }
+          free (slice);
+        }
+      else if (baish_try_parse_answer_commands (p, answerp, cmdsp, ncmdsp))
         return 1;
       p++;
     }
