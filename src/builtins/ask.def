@@ -35,6 +35,17 @@ $PRODUCES ask.c
 #include "common.h"
 #include "bashgetopt.h"
 
+/* Buffer size constants */
+#define BAISH_TRANSPORT_ERROR_SIZE 256
+#define BAISH_INITIAL_BUFFER_SIZE 4096
+#define BAISH_INITIAL_HTTP_BUFFER_SIZE 8192
+#define BAISH_MAX_MODELS 200
+#define BAISH_JSON_BODY_PADDING 2048
+
+/* Forward declarations */
+static void baish_print_llm_env_help (void);
+static void baish_free_string_list (char **s, int n);
+
 $BUILTIN ask
 $FUNCTION ask_builtin
 $SHORT_DOC ask [-c] [-j] [question...]
@@ -125,7 +136,7 @@ baish_strcasestr (const char *haystack, const char *needle)
   return 0;
 }
 
-static char baish_transport_error[256];
+static char baish_transport_error[BAISH_TRANSPORT_ERROR_SIZE];
 
 static void
 baish_clear_transport_error (void)
@@ -160,7 +171,7 @@ baish_diag_enabled (void)
   v = get_string_value ("BAISH_ASK_DEBUG");
   if (baish_truthy (v))
     return 1;
-  v = get_string_value ("BIASH_VERBOSE");
+  v = get_string_value ("BAISH_VERBOSE");
   if (baish_truthy (v))
     return 1;
   return 0;
@@ -265,7 +276,7 @@ baish_slurp_stream (FILE *fp, size_t *lenp)
   char *buf;
   size_t n;
 
-  cap = 4096;
+  cap = BAISH_INITIAL_BUFFER_SIZE;
   len = 0;
   buf = (char *)xmalloc (cap);
 
@@ -623,7 +634,7 @@ baish_http_read_response (int sfd, const char *host, const char *port, int *keep
   int close_conn;
   int chunked;
 
-  cap = 8192;
+  cap = BAISH_INITIAL_HTTP_BUFFER_SIZE;
   len = 0;
   resp = (char *)xmalloc (cap);
   header_end = 0;
@@ -1201,7 +1212,7 @@ baish_extract_model_ids (const char *json, char ***idsp, int *nids)
       cJSON_ArrayForEach (item, data)
         {
           cJSON *id;
-          if (n >= 200)
+          if (n >= BAISH_MAX_MODELS)
             break;
           if (cJSON_IsObject (item) == 0)
             continue;
@@ -1297,6 +1308,68 @@ baish_free_string_list (char **s, int n)
     if (s[i])
       free (s[i]);
   free (s);
+}
+
+static void
+baish_cleanup_and_exit (char *question, char *host, char *port, char *base_path,
+                        char *path, char *models_path, char **models, int nmodels,
+                        char *preflight_error)
+{
+  bind_variable ("BAISH_LAST_ANSWER", "", 0);
+  bind_variable ("BAISH_LAST_COMMANDS", "", 0);
+  if (preflight_error)
+    free (preflight_error);
+  if (question)
+    free (question);
+  if (host)
+    free (host);
+  if (port)
+    free (port);
+  if (base_path)
+    free (base_path);
+  if (path)
+    free (path);
+  if (models_path)
+    free (models_path);
+  baish_free_string_list (models, nmodels);
+}
+
+static int
+baish_handle_preflight_failure (int preflight_result, int preflight_status,
+                                const char *label, const char *host, const char *port,
+                                char *question, char *base_path, char *path,
+                                char *models_path, char **models, int nmodels,
+                                char *preflight_error)
+{
+  if (preflight_result == -1)
+    {
+      baish_cleanup_and_exit (question, (char *)host, (char *)port, base_path, path,
+                             models_path, models, nmodels, preflight_error);
+      if (baish_transport_error[0])
+        builtin_error (_("%s: %s"), label, baish_transport_error);
+      else if (host && port)
+        builtin_error (_("%s (cannot reach %s:%s)"), label, host, port);
+      else if (host)
+        builtin_error (_("%s (cannot reach %s)"), label, host);
+      else
+        builtin_error (_("%s (cannot reach LLM)"), label);
+      baish_print_llm_env_help ();
+      return EXECUTION_FAILURE;
+    }
+
+  if (preflight_status != 200)
+    {
+      baish_cleanup_and_exit (question, (char *)host, (char *)port, base_path, path,
+                             models_path, models, nmodels, preflight_error);
+      if (preflight_error)
+        builtin_error (_("%s (HTTP %d): %s"), label, preflight_status, preflight_error);
+      else
+        builtin_error (_("%s (HTTP %d)"), label, preflight_status);
+      baish_print_llm_env_help ();
+      return EXECUTION_FAILURE;
+    }
+
+  return EXECUTION_SUCCESS;
 }
 
 static void
@@ -1725,6 +1798,7 @@ ask_builtin (WORD_LIST *list)
   int do_exec;
   int status;
   int run_commands;
+  int explicit_run_commands;
   int json_only;
   int opt;
 
@@ -1765,6 +1839,7 @@ ask_builtin (WORD_LIST *list)
   preflight_result = 0;
   preflight_done = 0;
   run_commands = 0;
+  explicit_run_commands = 0;
   json_only = 0;
 
   reset_internal_getopt ();
@@ -1774,6 +1849,7 @@ ask_builtin (WORD_LIST *list)
         {
         case 'c':
           run_commands = 1;
+          explicit_run_commands = 1;
           break;
         case 'j':
           json_only = 1;
@@ -1901,55 +1977,18 @@ ask_builtin (WORD_LIST *list)
   if (model_missing)
     {
       const char *label;
+      int result;
 
       label = fail_fast_enabled ? "fail-fast preflight failed" : "preflight failed";
 
       if (preflight_done)
         {
-          if (preflight_result == -1)
-            {
-              bind_variable ("BAISH_LAST_ANSWER", "", 0);
-              bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-              if (baish_transport_error[0])
-                builtin_error (_("%s: %s"), label, baish_transport_error);
-              else if (host && port)
-                builtin_error (_("%s (cannot reach %s:%s)"), label, host, port);
-              else if (host)
-                builtin_error (_("%s (cannot reach %s)"), label, host);
-              else
-                builtin_error (_("%s (cannot reach LLM)"), label);
-              baish_print_llm_env_help ();
-              if (preflight_error)
-                free (preflight_error);
-              free (question);
-              free (host);
-              if (port) free (port);
-              free (base_path);
-              free (path);
-              if (models_path) free (models_path);
-              baish_free_string_list (models, nmodels);
-              return (EXECUTION_FAILURE);
-            }
-          if (preflight_status != 200)
-            {
-              bind_variable ("BAISH_LAST_ANSWER", "", 0);
-              bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-              if (preflight_error)
-                builtin_error (_("%s (HTTP %d): %s"), label, preflight_status, preflight_error);
-              else
-                builtin_error (_("%s (HTTP %d)"), label, preflight_status);
-              baish_print_llm_env_help ();
-              if (preflight_error)
-                free (preflight_error);
-              free (question);
-              free (host);
-              if (port) free (port);
-              free (base_path);
-              free (path);
-              if (models_path) free (models_path);
-              baish_free_string_list (models, nmodels);
-              return (EXECUTION_FAILURE);
-            }
+          result = baish_handle_preflight_failure (preflight_result, preflight_status,
+                                                   label, host, port, question, base_path,
+                                                   path, models_path, models, nmodels,
+                                                   preflight_error);
+          if (result != EXECUTION_SUCCESS)
+            return result;
         }
 
       bind_variable ("BAISH_LAST_ANSWER", "", 0);
@@ -1986,53 +2025,16 @@ ask_builtin (WORD_LIST *list)
   if (preflight_done)
     {
       const char *label;
+      int result;
 
       label = fail_fast_enabled ? "fail-fast preflight failed" : "preflight failed";
 
-      if (preflight_result == -1)
-        {
-          bind_variable ("BAISH_LAST_ANSWER", "", 0);
-          bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-          if (baish_transport_error[0])
-            builtin_error (_("%s: %s"), label, baish_transport_error);
-          else if (host && port)
-            builtin_error (_("%s (cannot reach %s:%s)"), label, host, port);
-          else if (host)
-            builtin_error (_("%s (cannot reach %s)"), label, host);
-          else
-            builtin_error (_("%s (cannot reach LLM)"), label);
-          baish_print_llm_env_help ();
-          if (preflight_error)
-            free (preflight_error);
-          free (question);
-          free (host);
-          if (port) free (port);
-          free (base_path);
-          free (path);
-          if (models_path) free (models_path);
-          baish_free_string_list (models, nmodels);
-          return (EXECUTION_FAILURE);
-        }
-      if (preflight_status != 200)
-        {
-          bind_variable ("BAISH_LAST_ANSWER", "", 0);
-          bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-          if (preflight_error)
-            builtin_error (_("%s (HTTP %d): %s"), label, preflight_status, preflight_error);
-          else
-            builtin_error (_("%s (HTTP %d)"), label, preflight_status);
-          baish_print_llm_env_help ();
-          if (preflight_error)
-            free (preflight_error);
-          free (question);
-          free (host);
-          if (port) free (port);
-          free (base_path);
-          free (path);
-          if (models_path) free (models_path);
-          baish_free_string_list (models, nmodels);
-          return (EXECUTION_FAILURE);
-        }
+      result = baish_handle_preflight_failure (preflight_result, preflight_status,
+                                               label, host, port, question, base_path,
+                                               path, models_path, models, nmodels,
+                                               preflight_error);
+      if (result != EXECUTION_SUCCESS)
+        return result;
 
       if (preflight_result == 0)
         {
@@ -2098,32 +2100,35 @@ ask_builtin (WORD_LIST *list)
     }
 
   escaped = baish_json_escape (question);
-  body = (char *)xmalloc (strlen (escaped) + strlen (model) + strlen (os_type) + strlen (cpu_arch) + 2048);
-  sprintf (body,
-           "{"
-           "\"model\":\"%s\","
-           "\"input\":["
-           "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Respond with JSON that matches the schema.\"},"
-           "{\"role\":\"user\",\"content\":\"%s\"}"
-           "],"
-           "\"text\":{"
-           "\"format\":{"
-           "\"type\":\"json_schema\","
-           "\"name\":\"baish_answer\","
-           "\"strict\":true,"
-           "\"schema\":{"
-           "\"type\":\"object\","
-           "\"properties\":{"
-           "\"answer\":{\"type\":\"string\"},"
-           "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
-           "},"
-           "\"required\":[\"answer\",\"commands\"],"
-           "\"additionalProperties\":false"
-           "}"
-           "}"
-           "}"
-           "}",
-           model, os_type, cpu_arch, escaped);
+  {
+    size_t body_size = strlen (escaped) + strlen (model) + strlen (os_type) + strlen (cpu_arch) + BAISH_JSON_BODY_PADDING;
+    body = (char *)xmalloc (body_size);
+    snprintf (body, body_size,
+             "{"
+             "\"model\":\"%s\"," 
+             "\"input\":["
+             "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Only propose shell commands when strictly required to answer; otherwise return an empty commands array. Do not run uname or other OS-identification commands unless the user explicitly asks. Do not read or execute local files (including AGENTS.md) unless the user explicitly requests it. Do not put shell expansions like $(...) in the answer; put commands only in the commands array. Respond with JSON that matches the schema.\"},"
+             "{\"role\":\"user\",\"content\":\"%s\"}"
+             "],"
+             "\"text\":{"
+             "\"format\":{"
+             "\"type\":\"json_schema\"," 
+             "\"name\":\"baish_answer\"," 
+             "\"strict\":true,"
+             "\"schema\":{"
+             "\"type\":\"object\"," 
+             "\"properties\":{"
+             "\"answer\":{\"type\":\"string\"},"
+             "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+             "},"
+             "\"required\":[\"answer\",\"commands\"],"
+             "\"additionalProperties\":false"
+             "}"
+             "}"
+             "}"
+             "}",
+             model, os_type, cpu_arch, escaped);
+  }
 
   {
     long http_status;
@@ -2313,8 +2318,11 @@ ask_builtin (WORD_LIST *list)
   bind_variable ("BAISH_LAST_ANSWER", answer, 0);
   bind_variable ("BAISH_LAST_COMMANDS", joined, 0);
 
-  printf ("%s\n", answer);
-  fflush (stdout);
+  if (explicit_run_commands == 0 || ncmds == 0)
+    {
+      printf ("%s\n", answer);
+      fflush (stdout);
+    }
 
   do_exec = 0;
   if (ncmds > 0)
@@ -2325,7 +2333,10 @@ ask_builtin (WORD_LIST *list)
         {
           int j;
           for (j = 0; j < ncmds; j++)
-            fprintf (stderr, "baish: command[%d]: %s\n", j + 1, cmds[j]);
+            {
+              if (cmds[j] && *cmds[j])
+                fprintf (stderr, "baish: command[%d]: %s\n", j + 1, cmds[j]);
+            }
         }
     }
 
@@ -2335,8 +2346,11 @@ ask_builtin (WORD_LIST *list)
       for (i = 0; i < ncmds; i++)
         {
           int r;
-          r = parse_and_execute (savestring (cmds[i]), "ask", SEVAL_NOHIST|SEVAL_RESETLINE);
-          status = r;
+          if (cmds[i] && *cmds[i])
+            {
+              r = parse_and_execute (savestring (cmds[i]), "ask", SEVAL_NOHIST|SEVAL_RESETLINE);
+              status = r;
+            }
         }
     }
 

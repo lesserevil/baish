@@ -163,7 +163,7 @@ OFILES = builtins.o \
 	common.o declare.o echo.o enable.o eval.o evalfile.o \
 	evalstring.o exec.o exit.o fc.o fg_bg.o hash.o help.o history.o \
 	jobs.o kill.o let.o mapfile.o ask.o \
-	openai_core.o openai_chat.o cjson/cJSON.o \
+	openai_core.o openai_chat.o cJSON.o \
 	pushd.o read.o return.o set.o setattr.o shift.o source.o \
 	suspend.o test.o times.o trap.o type.o ulimit.o umask.o \
 	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o
@@ -241,8 +241,12 @@ builtins.o: builtins.c
 common.o: common.c
 bashgetopt.o: bashgetopt.c
 getopt.o: getopt.c
-evalstring.o: evalstring.c          
+evalstring.o: evalstring.c
 evalfile.o: evalfile.c
+
+cJSON.o: cjson/cJSON.c
+	$(RM) $@
+	$(CC) -c $(CCFLAGS) $<
 
 tmpbuiltins.o: tmpbuiltins.c
 gen-helpfiles.o: gen-helpfiles.c
@@ -697,6 +701,11 @@ mapfile.o: $(topdir)/quit.h $(topdir)/dispose_cmd.h $(topdir)/make_cmd.h $(topdi
 mapfile.o: $(topdir)/subst.h $(topdir)/externs.h $(BASHINCDIR)/maxpath.h
 mapfile.o: $(topdir)/shell.h $(topdir)/syntax.h $(topdir)/variables.h $(topdir)/conftypes.h
 mapfile.o: $(topdir)/arrayfunc.h ../pathnames.h
+
+cJSON.o: cjson/cJSON.c cjson/cJSON.h
+openai_core.o: openai.h cjson/cJSON.h
+openai_chat.o: openai.h cjson/cJSON.h
+ask.o: openai.h cjson/cJSON.h
 
 bind.o: $(RL_LIBSRC)/rlconf.h
 bind.o: $(RL_LIBSRC)/keymaps.h $(RL_LIBSRC)/rlstdc.h
