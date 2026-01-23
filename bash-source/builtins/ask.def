@@ -12,8 +12,10 @@ $PRODUCES ask.c
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #if defined (HAVE_UNISTD_H)
 #  include <unistd.h>
@@ -110,6 +112,72 @@ baish_strcasestr (const char *haystack, const char *needle)
         return h;
     }
   return 0;
+}
+
+static char baish_transport_error[256];
+
+static void
+baish_clear_transport_error (void)
+{
+  baish_transport_error[0] = '\0';
+}
+
+static void
+baish_set_transport_error (const char *fmt, ...)
+{
+  va_list ap;
+
+  if (fmt == 0)
+    {
+      baish_transport_error[0] = '\0';
+      return;
+    }
+
+  va_start (ap, fmt);
+  vsnprintf (baish_transport_error, sizeof (baish_transport_error), fmt, ap);
+  va_end (ap);
+}
+
+static int
+baish_diag_enabled (void)
+{
+  return (interactive_shell && isatty (fileno (stderr)));
+}
+
+static void
+baish_diag (const char *fmt, ...)
+{
+  va_list ap;
+
+  if (baish_diag_enabled () == 0)
+    return;
+  if (fmt == 0)
+    return;
+
+  fprintf (stderr, "baish: ");
+  va_start (ap, fmt);
+  vfprintf (stderr, fmt, ap);
+  va_end (ap);
+  fprintf (stderr, "\n");
+  fflush (stderr);
+}
+
+static int
+baish_http_timeout_seconds (void)
+{
+  const char *s;
+  long v;
+
+  s = get_string_value ("BAISH_HTTP_TIMEOUT_SECS");
+  if (s == 0 || *s == 0)
+    return 15;
+
+  v = strtol (s, 0, 10);
+  if (v < 1)
+    return 15;
+  if (v > 600)
+    return 600;
+  return (int)v;
 }
 
 static char *
@@ -327,6 +395,8 @@ baish_http_post_try_ports (const char *host, const char *port, const char *path,
   char *resp;
   int i;
 
+  baish_clear_transport_error ();
+
   if (port && *port)
     return baish_http_post (host, port, path, auth_bearer, body);
 
@@ -398,6 +468,8 @@ baish_http_get_try_ports (const char *host, const char *port, const char *path, 
   char *resp;
   int i;
 
+  baish_clear_transport_error ();
+
   if (port && *port)
     return baish_http_get (host, port, path, auth_bearer);
 
@@ -417,6 +489,7 @@ baish_http_get (const char *host, const char *port, const char *path, const char
   struct addrinfo hints, *res, *rp;
   int sfd;
   int ga;
+  int timeout_sec;
   char *req;
   size_t reqlen;
   char *resp;
@@ -427,9 +500,14 @@ baish_http_get (const char *host, const char *port, const char *path, const char
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
 
+  baish_diag ("resolving %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
+
   ga = getaddrinfo (host, port, &hints, &res);
   if (ga != 0)
-    return 0;
+    {
+      baish_set_transport_error ("getaddrinfo(%s:%s): %s", host ? host : "", port ? port : "", gai_strerror (ga));
+      return 0;
+    }
 
   sfd = -1;
   for (rp = res; rp; rp = rp->ai_next)
@@ -437,8 +515,20 @@ baish_http_get (const char *host, const char *port, const char *path, const char
       sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
       if (sfd < 0)
         continue;
+
+      timeout_sec = baish_http_timeout_seconds ();
+      {
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt (sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+        setsockopt (sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+      }
+
+      baish_diag ("connecting to %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
       if (connect (sfd, rp->ai_addr, rp->ai_addrlen) == 0)
         break;
+      baish_set_transport_error ("connect(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
       close (sfd);
       sfd = -1;
     }
@@ -478,6 +568,7 @@ baish_http_get (const char *host, const char *port, const char *path, const char
         n = write (sfd, p, left);
         if (n <= 0)
           {
+            baish_set_transport_error ("write(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
             free (req);
             close (sfd);
             return 0;
@@ -492,14 +583,25 @@ baish_http_get (const char *host, const char *port, const char *path, const char
   len = 0;
   resp = (char *)xmalloc (cap);
 
-  while ((n = read (sfd, resp + len, cap - len - 1)) > 0)
+  while (1)
     {
-      len += (size_t)n;
-      if (len + 4096 >= cap)
+      n = read (sfd, resp + len, cap - len - 1);
+      if (n > 0)
         {
-          cap *= 2;
-          resp = (char *)xrealloc (resp, cap);
+          len += (size_t)n;
+          if (len + 4096 >= cap)
+            {
+              cap *= 2;
+              resp = (char *)xrealloc (resp, cap);
+            }
+          continue;
         }
+      if (n == 0)
+        break;
+      baish_set_transport_error ("read(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
+      free (resp);
+      close (sfd);
+      return 0;
     }
 
   close (sfd);
@@ -513,6 +615,7 @@ baish_http_post (const char *host, const char *port, const char *path, const cha
   struct addrinfo hints, *res, *rp;
   int sfd;
   int ga;
+  int timeout_sec;
   size_t bodylen;
   char *req;
   size_t reqlen;
@@ -524,9 +627,14 @@ baish_http_post (const char *host, const char *port, const char *path, const cha
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
 
+  baish_diag ("resolving %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
+
   ga = getaddrinfo (host, port, &hints, &res);
   if (ga != 0)
-    return 0;
+    {
+      baish_set_transport_error ("getaddrinfo(%s:%s): %s", host ? host : "", port ? port : "", gai_strerror (ga));
+      return 0;
+    }
 
   sfd = -1;
   for (rp = res; rp; rp = rp->ai_next)
@@ -534,8 +642,20 @@ baish_http_post (const char *host, const char *port, const char *path, const cha
       sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
       if (sfd < 0)
         continue;
+
+      timeout_sec = baish_http_timeout_seconds ();
+      {
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt (sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+        setsockopt (sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+      }
+
+      baish_diag ("connecting to %s:%s%s", host ? host : "", port ? port : "", path ? path : "");
       if (connect (sfd, rp->ai_addr, rp->ai_addrlen) == 0)
         break;
+      baish_set_transport_error ("connect(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
       close (sfd);
       sfd = -1;
     }
@@ -582,6 +702,7 @@ baish_http_post (const char *host, const char *port, const char *path, const cha
         n = write (sfd, p, left);
         if (n <= 0)
           {
+            baish_set_transport_error ("write(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
             free (req);
             close (sfd);
             return 0;
@@ -596,14 +717,25 @@ baish_http_post (const char *host, const char *port, const char *path, const cha
   len = 0;
   resp = (char *)xmalloc (cap);
 
-  while ((n = read (sfd, resp + len, cap - len - 1)) > 0)
+  while (1)
     {
-      len += (size_t)n;
-      if (len + 4096 >= cap)
+      n = read (sfd, resp + len, cap - len - 1);
+      if (n > 0)
         {
-          cap *= 2;
-          resp = (char *)xrealloc (resp, cap);
+          len += (size_t)n;
+          if (len + 4096 >= cap)
+            {
+              cap *= 2;
+              resp = (char *)xrealloc (resp, cap);
+            }
+          continue;
         }
+      if (n == 0)
+        break;
+      baish_set_transport_error ("read(%s:%s): %s", host ? host : "", port ? port : "", strerror (errno));
+      free (resp);
+      close (sfd);
+      return 0;
     }
 
   close (sfd);
@@ -791,6 +923,7 @@ baish_print_llm_env_help (void)
   fprintf (stderr, "  export BAISH_MODEL=MODEL_ID\n");
   fprintf (stderr, "  export OPENAI_API_KEY=...                     # optional\n");
   fprintf (stderr, "  export BAISH_FAIL_FAST=1                      # optional preflight\n");
+  fprintf (stderr, "  export BAISH_HTTP_TIMEOUT_SECS=15             # optional transport timeout\n");
 }
 
 static char *
@@ -1018,8 +1151,6 @@ ask_builtin (WORD_LIST *list)
   int do_exec;
   int status;
 
-  int used_default_base_url;
-  int used_default_model;
   char *models_path;
   char **models;
   int nmodels;
@@ -1033,8 +1164,6 @@ ask_builtin (WORD_LIST *list)
   const char *api_key = get_string_value ("OPENAI_API_KEY");
   int explicit_port;
 
-  used_default_base_url = 0;
-  used_default_model = 0;
   models_path = 0;
   models = 0;
   nmodels = 0;
@@ -1042,18 +1171,17 @@ ask_builtin (WORD_LIST *list)
 
   if (base_url == 0)
     base_url = get_string_value ("OPENAI_BASE_URL");
-  if (base_url == 0)
-    {
-      base_url = "puck.local";
-      used_default_base_url = 1;
-    }
 
   if (model == 0)
     model = get_string_value ("OPENAI_MODEL");
-  if (model == 0)
+
+  if (base_url == 0)
     {
-      model = "gpt-4o-mini";
-      used_default_model = 1;
+      bind_variable ("BAISH_LAST_ANSWER", "", 0);
+      bind_variable ("BAISH_LAST_COMMANDS", "", 0);
+      builtin_error (_("BAISH_OPENAI_BASE_URL is not set"));
+      baish_print_llm_env_help ();
+      return (EXECUTION_FAILURE);
     }
 
   if (list)
@@ -1108,6 +1236,56 @@ ask_builtin (WORD_LIST *list)
   path = baish_join_api_path (base_path, "/chat/completions");
   models_path = baish_join_api_path (base_path, "/models");
 
+  if (model == 0 || *model == 0)
+    {
+      char *mresp;
+      char *mbody;
+      int mstatus;
+
+      bind_variable ("BAISH_LAST_ANSWER", "", 0);
+      bind_variable ("BAISH_LAST_COMMANDS", "", 0);
+      builtin_error (_("BAISH_MODEL is not set"));
+
+      mresp = baish_http_get_try_ports (host, port, models_path, api_key);
+      if (mresp)
+        {
+          mstatus = baish_http_status_code (mresp);
+          mbody = baish_http_body (mresp);
+          free (mresp);
+          if (mbody && mstatus == 200)
+            {
+              if (baish_extract_model_ids (mbody, &models, &nmodels))
+                have_models = 1;
+            }
+          if (mbody)
+            free (mbody);
+        }
+
+      if (have_models)
+        {
+          int j;
+          int limit;
+          fprintf (stderr, "baish: models reported by the API (%d):\n", nmodels);
+          limit = (nmodels > 50) ? 50 : nmodels;
+          for (j = 0; j < limit; j++)
+            fprintf (stderr, "  %s\n", models[j]);
+          if (nmodels > limit)
+            fprintf (stderr, "  ... (%d more)\n", nmodels - limit);
+        }
+      else if (baish_transport_error[0])
+        fprintf (stderr, "baish: could not list models (%s)\n", baish_transport_error);
+
+      baish_print_llm_env_help ();
+      free (question);
+      free (host);
+      if (port) free (port);
+      free (base_path);
+      free (path);
+      if (models_path) free (models_path);
+      baish_free_string_list (models, nmodels);
+      return (EXECUTION_FAILURE);
+    }
+
   if (baish_truthy (fail_fast))
     {
       char *pre;
@@ -1119,18 +1297,18 @@ ask_builtin (WORD_LIST *list)
         {
           bind_variable ("BAISH_LAST_ANSWER", "", 0);
           bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-          builtin_error (_("fail-fast preflight failed (cannot reach LLM)"));
+          if (baish_transport_error[0])
+            builtin_error (_("fail-fast preflight failed: %s"), baish_transport_error);
+          else
+            builtin_error (_("fail-fast preflight failed (cannot reach LLM)"));
           baish_print_llm_env_help ();
-          if (used_default_base_url)
-            fprintf (stderr, "baish: BAISH_OPENAI_BASE_URL not set; defaulting to %s\n", base_url);
-          if (used_default_model)
-            fprintf (stderr, "baish: BAISH_MODEL not set; defaulting to %s\n", model);
           free (question);
           free (host);
           if (port) free (port);
           free (base_path);
           free (path);
           free (models_path);
+          baish_free_string_list (models, nmodels);
           return (EXECUTION_FAILURE);
         }
 
@@ -1159,6 +1337,7 @@ ask_builtin (WORD_LIST *list)
           free (base_path);
           free (path);
           free (models_path);
+          baish_free_string_list (models, nmodels);
           return (EXECUTION_FAILURE);
         }
 
@@ -1190,12 +1369,11 @@ ask_builtin (WORD_LIST *list)
     {
       bind_variable ("BAISH_LAST_ANSWER", "", 0);
       bind_variable ("BAISH_LAST_COMMANDS", "", 0);
-	  builtin_error (_("request failed (cannot reach LLM)"));
+	  if (baish_transport_error[0])
+	    builtin_error (_("request failed: %s"), baish_transport_error);
+	  else
+	    builtin_error (_("request failed (cannot reach LLM)"));
 	  baish_print_llm_env_help ();
-	  if (used_default_base_url)
-	    fprintf (stderr, "baish: BAISH_OPENAI_BASE_URL not set; defaulting to %s\n", base_url);
-	  if (used_default_model)
-	    fprintf (stderr, "baish: BAISH_MODEL not set; defaulting to %s\n", model);
 	  free (host);
 	  if (port) free (port);
 	  free (base_path);
@@ -1289,8 +1467,7 @@ ask_builtin (WORD_LIST *list)
           }
         else
           {
-            if (used_default_model)
-              fprintf (stderr, "baish: BAISH_MODEL not set; defaulting to %s\n", model);
+            ;
           }
 
         free (json);
