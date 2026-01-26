@@ -6,6 +6,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project uses a version scheme of MAJOR.MINOR.PATCH-baish.BUILD.
 
 ## [Unreleased]
+## [5.3.0-baish.2] - 2026-01-26
+
+### Changes
+
+- Fix release script to force-add gitignored version files
+- Fix changelog insertion in release script
+- Add automated release system
+- Complete code review implementation: security fixes, tests, and infrastructure
+- Ignore temporary .tmp-* files
+- Add rationale for builtin ask in README
+- Merge pull request #2 from jordanhubbard/copilot/add-mcp-support-to-baish
+- Merge main branch preserving MCP implementation
+- Merge main branch with MCP implementation preserved
+- Support round-robin ask endpoints and models
+- bd sync: 2026-01-23 10:02:02
+- Refine ask execution output and prompt guardrails to avoid unnecessary commands and file access. Align builtins cJSON build wiring.
+- Tighten ask output parsing and silence notice by default
+- Adopt openai-c transport and cJSON parsing for ask builtin
+- Reuse keep-alive connections for ask to reduce latency and handle Responses output.
+- Retry JSON parsing within ask output
+- Ignore beads daemon-error file
+- Include OS and arch context in ask prompt
+- Remove now obsolete bash handbook and move source directory
+- Add ask flags for JSON and execution
+- bd sync: 2026-01-22 21:31:43
+- Close bead baish-4pk
+- Preflight models before ask output
+- bd sync: 2026-01-22 20:55:58
+- Close bead baish-4pk
+- Improve ask notices and error guidance
+- bd sync: 2026-01-22 20:42:22
+- Add comment about ask interactive behavior
+- Tame ask diagnostics and show config sources
+- Remove checked-in LLM defaults
+- Prevent ask hangs with timeouts and config guidance
+- Improve ask builtin LLM diagnostics and preflight
+- Document baish AI help and ignore build outputs
+- Initial version
+- Document baish AI config and support host-only base URLs
+- bd sync: 2026-01-22 05:41:21
+- Create baish fork with OpenAI ask builtin
+- Update README with MCP feature documentation and build instructions
+- Add test script and implementation summary documentation
+- Fix memory safety issues in MCP implementation
+- Add .gitignore and remove build artifacts from version control
+- Add basic MCP builtin command with connect/disconnect/list subcommands
+- Initial plan
+- Initial checkin
+- Merge pull request #1 from jordanhubbard/copilot/extract-bash-handbook-contents
+- Fix extraction command to avoid nested directory
+- Add bash handbook review and prepare bash source directory
+- Initial plan
+- Initial commit
+
+
 - Remove checked-in LLM defaults
 - Prevent ask hangs with timeouts and config guidance
 - Improve ask builtin LLM diagnostics and preflight
