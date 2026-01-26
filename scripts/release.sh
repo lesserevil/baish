@@ -232,16 +232,24 @@ EOF
     fi
 
     # Generate new entry
-    local new_entry=$(generate_changelog_entry "$version" "$previous_tag")
-
-    # Insert new entry after the header
     local temp_file=$(mktemp)
-    awk -v entry="$new_entry" '
-        /^# Changelog/ { print; getline; print; print entry; next }
-        { print }
-    ' "$CHANGELOG" > "$temp_file"
+    local entry_file=$(mktemp)
+
+    # Generate the entry and save to temp file
+    generate_changelog_entry "$version" "$previous_tag" > "$entry_file"
+
+    # Find the line number after the header (line with "MAJOR.MINOR.PATCH-baish.BUILD.")
+    local insert_line=$(grep -n "MAJOR.MINOR.PATCH-baish.BUILD" "$CHANGELOG" | cut -d: -f1)
+    insert_line=$((insert_line + 2))  # Skip the blank line after
+
+    # Insert entry: header + blank line + new entry + blank line + rest of file
+    head -n "$insert_line" "$CHANGELOG" > "$temp_file"
+    cat "$entry_file" >> "$temp_file"
+    echo "" >> "$temp_file"
+    tail -n +$((insert_line + 1)) "$CHANGELOG" >> "$temp_file"
 
     mv "$temp_file" "$CHANGELOG"
+    rm -f "$entry_file"
 
     info "✓ Changelog updated"
 }
