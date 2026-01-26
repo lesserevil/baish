@@ -42,6 +42,12 @@ $PRODUCES ask.c
 #define BAISH_INITIAL_HTTP_BUFFER_SIZE 8192
 #define BAISH_MAX_MODELS 200
 #define BAISH_JSON_BODY_PADDING 2048
+#define BAISH_MIN_PREVIEW_SIZE 8           /* Minimum chars to show in preview */
+#define BAISH_READ_CHUNK_SIZE 2048          /* Increment for reading streams */
+#define BAISH_HTTP_READ_CHUNK_SIZE 4096     /* Increment for HTTP reads */
+#define BAISH_JSON_ESCAPE_OVERHEAD 32       /* Extra space for JSON escaping */
+#define BAISH_DEFAULT_TIMEOUT_SECS 15       /* Default HTTP timeout */
+#define BAISH_MAX_TIMEOUT_SECS 600          /* Maximum HTTP timeout */
 
 /* Forward declarations */
 static void baish_print_llm_env_help (void);
@@ -159,7 +165,11 @@ baish_next_rr_index (void)
 {
   static unsigned long counter = 0;
   unsigned long idx = counter;
-  counter++;
+  /* Wrap counter on overflow - acceptable behavior for round-robin */
+  if (counter == ULONG_MAX)
+    counter = 0;
+  else
+    counter++;
   return idx;
 }
 
@@ -298,8 +308,8 @@ baish_sanitize_preview (const char *s, int max)
 
   if (s == 0)
     return savestring ("?");
-  if (max < 8)
-    max = 8;
+  if (max < BAISH_MIN_PREVIEW_SIZE)
+    max = BAISH_MIN_PREVIEW_SIZE;
 
   out = (char *)xmalloc (max + 1);
   i = 0;
@@ -358,7 +368,7 @@ baish_slurp_stream (FILE *fp, size_t *lenp)
 
   while (1)
     {
-      if (len + 2048 >= cap)
+      if (len + BAISH_READ_CHUNK_SIZE >= cap)
         {
           cap *= 2;
           buf = (char *)xrealloc (buf, cap);
@@ -384,7 +394,7 @@ baish_json_escape (const char *s)
   if (s == 0)
     return savestring ("");
 
-  cap = strlen (s) * 2 + 32;
+  cap = strlen (s) * 2 + BAISH_JSON_ESCAPE_OVERHEAD;
   out = (char *)xmalloc (cap);
   o = 0;
 
@@ -565,6 +575,11 @@ typedef struct
   char *port;
 } baish_http_conn;
 
+/* HTTP connection cache for keep-alive reuse.
+ * IMPORTANT: This is not thread-safe. Assumes single-threaded bash execution.
+ * If bash becomes multi-threaded or if signal handlers could access this,
+ * synchronization would be required.
+ */
 static baish_http_conn baish_http_cached_conn = { -1, 0, 0 };
 
 static void
@@ -722,7 +737,7 @@ baish_http_read_response (int sfd, const char *host, const char *port, int *keep
 
   while (1)
     {
-      if (len + 4096 >= cap)
+      if (len + BAISH_HTTP_READ_CHUNK_SIZE >= cap)
         {
           cap *= 2;
           resp = (char *)xrealloc (resp, cap);
@@ -977,7 +992,8 @@ static int
 baish_http_status_code (const char *resp)
 {
   const char *p;
-  int code;
+  char *endp;
+  long code_long;
 
   if (resp == 0)
     return 0;
@@ -990,8 +1006,10 @@ baish_http_status_code (const char *resp)
   while (*p == ' ')
     p++;
 
-  code = atoi (p);
-  return code;
+  code_long = strtol (p, &endp, 10);
+  if (endp == p || code_long < 100 || code_long > 599)
+    return 0; /* invalid or out-of-range status code */
+  return (int)code_long;
 }
 
 static char *
@@ -1185,7 +1203,7 @@ baish_http_body (const char *resp)
   if (headers && (baish_strcasestr (headers, "Transfer-Encoding: chunked") != 0))
     {
       const char *bp = body;
-      size_t cap = 4096;
+      size_t cap = BAISH_INITIAL_BUFFER_SIZE;
       size_t len = 0;
 
       decoded = (char *)xmalloc (cap);
@@ -1585,6 +1603,11 @@ baish_extract_response_text (const char *json)
   return baish_extract_message_content (json);
 }
 
+/* Strip <think>...</think> blocks from LLM output.
+ * Returns NULL if input is NULL.
+ * Removes all think blocks and skips content before final </think>.
+ * Caller must free the returned string.
+ */
 static char *
 baish_strip_think_blocks (const char *s)
 {
@@ -1725,6 +1748,7 @@ baish_try_parse_answer_commands (const char *s, char **answerp, char ***cmdsp, i
   root = cJSON_ParseWithOpts (s, 0, 0);
   if (root == 0 || cJSON_IsObject (root) == 0)
     {
+      baish_diag ("JSON parse failed - not a valid JSON object");
       if (root)
         cJSON_Delete (root);
       return 0;
@@ -1737,6 +1761,7 @@ baish_try_parse_answer_commands (const char *s, char **answerp, char ***cmdsp, i
   commands_item = cJSON_GetObjectItemCaseSensitive (root, "commands");
   if (commands_item && cJSON_IsArray (commands_item) == 0)
     {
+      baish_diag ("JSON schema mismatch - 'commands' field is not an array");
       cJSON_Delete (root);
       if (answer)
         free (answer);
@@ -2017,7 +2042,7 @@ ask_builtin (WORD_LIST *list)
       if (qlen == 0)
         {
           free (question);
-	  builtin_error (_("missing question"));
+          builtin_error (_("missing question"));
           return (EXECUTION_FAILURE);
         }
     }
@@ -2226,22 +2251,25 @@ ask_builtin (WORD_LIST *list)
 
   escaped = baish_json_escape (question);
   {
-    size_t body_size = strlen (escaped) + strlen (model) + strlen (os_type) + strlen (cpu_arch) + BAISH_JSON_BODY_PADDING;
+    char *escaped_model = baish_json_escape (model);
+    char *escaped_os = baish_json_escape (os_type);
+    char *escaped_arch = baish_json_escape (cpu_arch);
+    size_t body_size = strlen (escaped) + strlen (escaped_model) + strlen (escaped_os) + strlen (escaped_arch) + BAISH_JSON_BODY_PADDING;
     body = (char *)xmalloc (body_size);
     snprintf (body, body_size,
              "{"
-             "\"model\":\"%s\"," 
+             "\"model\":\"%s\","
              "\"input\":["
              "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Only propose shell commands when strictly required to answer; otherwise return an empty commands array. Do not run uname or other OS-identification commands unless the user explicitly asks. Do not read or execute local files (including AGENTS.md) unless the user explicitly requests it. Do not put shell expansions like $(...) in the answer; put commands only in the commands array. Respond with JSON that matches the schema.\"},"
              "{\"role\":\"user\",\"content\":\"%s\"}"
              "],"
              "\"text\":{"
              "\"format\":{"
-             "\"type\":\"json_schema\"," 
-             "\"name\":\"baish_answer\"," 
+             "\"type\":\"json_schema\","
+             "\"name\":\"baish_answer\","
              "\"strict\":true,"
              "\"schema\":{"
-             "\"type\":\"object\"," 
+             "\"type\":\"object\","
              "\"properties\":{"
              "\"answer\":{\"type\":\"string\"},"
              "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
@@ -2252,7 +2280,10 @@ ask_builtin (WORD_LIST *list)
              "}"
              "}"
              "}",
-             model, os_type, cpu_arch, escaped);
+             escaped_model, escaped_os, escaped_arch, escaped);
+    free (escaped_model);
+    free (escaped_os);
+    free (escaped_arch);
   }
 
   {
@@ -2291,7 +2322,6 @@ ask_builtin (WORD_LIST *list)
       }
 
     json = resp;
-    resp = 0;
 
     if (json == 0)
       {

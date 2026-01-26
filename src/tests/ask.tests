@@ -1,0 +1,112 @@
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Tests for the ask builtin (LLM integration)
+
+# Save original environment
+ORIG_BASE_URL="${BAISH_OPENAI_BASE_URL}"
+ORIG_MODEL="${BAISH_MODEL}"
+ORIG_API_KEY="${OPENAI_API_KEY}"
+
+# Test 1: Help displays correctly
+help ask >/dev/null 2>&1
+echo "help ask: $?"
+
+# Test 2: Missing configuration - no BASE_URL
+unset BAISH_OPENAI_BASE_URL
+unset OPENAI_BASE_URL
+unset BAISH_MODEL
+ask "test" 2>&1 | grep -q "not configured"
+echo "ask no config: $?"
+
+# Test 3: Missing MODEL
+export BAISH_OPENAI_BASE_URL="localhost:8080"
+unset BAISH_MODEL
+unset OPENAI_MODEL
+ask "test" 2>&1 | grep -q "BAISH_MODEL"
+echo "ask no model: $?"
+
+# Test 4: Ask with no question should fail
+export BAISH_MODEL="test-model"
+echo "" | ask 2>&1 | grep -q "missing question"
+echo "ask empty stdin: $?"
+
+# Test 5: Flags - check -j flag is recognized
+ask -j "test" 2>&1
+# Should fail due to no server, but flag should be parsed
+echo "ask -j flag: $?"
+
+# Test 6: Flags - check -c flag is recognized
+ask -c "test" 2>&1
+# Should fail due to no server, but flag should be parsed
+echo "ask -c flag: $?"
+
+# Test 7: Environment variable fallback - OPENAI_BASE_URL
+unset BAISH_OPENAI_BASE_URL
+export OPENAI_BASE_URL="fallback-host"
+ask "test" 2>&1 | grep -q "fallback-host\|cannot reach"
+echo "ask OPENAI_BASE_URL fallback: $?"
+
+# Test 8: Environment variable fallback - OPENAI_MODEL
+export BAISH_OPENAI_BASE_URL="localhost"
+unset BAISH_MODEL
+export OPENAI_MODEL="fallback-model"
+ask "test" 2>&1
+echo "ask OPENAI_MODEL fallback: $?"
+
+# Test 9: Result variables should be empty after failed request
+unset BAISH_LAST_ANSWER
+unset BAISH_LAST_COMMANDS
+ask "test" 2>&1 >/dev/null
+test -z "$BAISH_LAST_ANSWER"
+echo "ask BAISH_LAST_ANSWER empty on failure: $?"
+test -z "$BAISH_LAST_COMMANDS"
+echo "ask BAISH_LAST_COMMANDS empty on failure: $?"
+
+# Test 10: URL parsing - various formats
+export BAISH_OPENAI_BASE_URL="http://host:8080/v1"
+export BAISH_MODEL="test"
+ask "test" 2>&1 | grep -q "host:8080\|cannot reach"
+echo "ask URL with http scheme: $?"
+
+export BAISH_OPENAI_BASE_URL="host,host2,host3"
+ask "test" 2>&1
+echo "ask URL list (round-robin): $?"
+
+# Test 11: Model list parsing
+export BAISH_MODEL="model1,model2,model3"
+ask "test" 2>&1
+echo "ask model list (round-robin): $?"
+
+# Restore original environment
+if [ -n "$ORIG_BASE_URL" ]; then
+  export BAISH_OPENAI_BASE_URL="$ORIG_BASE_URL"
+else
+  unset BAISH_OPENAI_BASE_URL
+fi
+
+if [ -n "$ORIG_MODEL" ]; then
+  export BAISH_MODEL="$ORIG_MODEL"
+else
+  unset BAISH_MODEL
+fi
+
+if [ -n "$ORIG_API_KEY" ]; then
+  export OPENAI_API_KEY="$ORIG_API_KEY"
+else
+  unset OPENAI_API_KEY
+fi
+
+# Note: Full integration tests with actual LLM responses require
+# a mock server that responds with expected JSON format:
+# {"answer":"...", "commands":["..."]}

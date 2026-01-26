@@ -1,0 +1,50 @@
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Tests for the MCP (Managed Control Points) builtin
+
+# Test 1: Help displays correctly
+help mcp >/dev/null 2>&1
+echo "help mcp: $?"
+
+# Test 2: No arguments shows usage
+mcp 2>&1 | grep -q "usage"
+echo "mcp no args: $?"
+
+# Test 3: Invalid subcommand
+mcp invalid_command 2>&1 | grep -q "unknown subcommand"
+echo "mcp invalid subcommand: $?"
+
+# Test 4: Disconnect without connection should fail
+mcp disconnect 2>&1 | grep -q "not connected"
+echo "mcp disconnect (not connected): $?"
+
+# Test 5: List without connection should fail
+mcp list 2>&1 | grep -q "not connected"
+echo "mcp list (not connected): $?"
+
+# Test 6: Connect without server name should fail
+mcp connect 2>&1 | grep -q "server name required"
+echo "mcp connect (no server): $?"
+
+# Test 7: Connect to invalid server should fail gracefully
+# This will fail but should not crash
+mcp connect invalid-server-that-does-not-exist:9999 2>&1 | grep -q "failed to connect"
+echo "mcp connect (invalid server): $?"
+
+# Test 8: State check - should still not be connected after failed attempt
+mcp list 2>&1 | grep -q "not connected"
+echo "mcp still not connected: $?"
+
+# Note: Actual connection tests require a running MCP server
+# These can be added in integration tests with a mock server

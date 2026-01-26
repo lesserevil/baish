@@ -58,9 +58,41 @@ Optional:
 
 - `BAISH_OPENAI_PORT` – port override **only** when `BAISH_OPENAI_BASE_URL` does **not** include an explicit `:port`
 - `OPENAI_API_KEY` – bearer token if your server requires auth
-- `BAISH_AUTOEXEC` – if non-zero, execute returned commands without prompting (default: `0`)
+- `BAISH_AUTOEXEC` – if non-zero, execute returned commands without prompting (default: `0`) **⚠️ SECURITY WARNING: Setting this to 1 allows automatic execution of LLM-generated commands without confirmation. Only use in trusted environments.**
+- `BAISH_FAIL_FAST` – if non-zero, preflight check the LLM `/models` endpoint before sending prompts (helps catch configuration errors early)
+- `BAISH_HTTP_TIMEOUT_SECS` – HTTP request timeout in seconds (default: `15`, max: `600`)
+- `BAISH_ASK_DEBUG` – if non-zero, enable verbose debug output for ask builtin
+- `BAISH_VERBOSE` – if non-zero, enable verbose output (similar to BAISH_ASK_DEBUG)
+- `BAISH_ASK_NOTICE` – if non-zero, show informational notices during ask operations
 
 If no port is provided, `baish` will try common HTTP ports (currently `80`, then `8000`).
+
+### Compatibility
+
+`baish` is designed to work with OpenAI-compatible API servers including:
+- OpenAI API (chat completions endpoint)
+- Local LLM servers (llama.cpp, Ollama, vLLM, etc.) with OpenAI-compatible APIs
+- Other providers implementing the OpenAI chat completion format
+
+**Note:** Different API implementations may have varying response formats. The `ask` builtin attempts to parse multiple response formats but works best with servers that strictly follow OpenAI's JSON schema.
+
+### Security Considerations
+
+**⚠️ IMPORTANT SECURITY WARNINGS:**
+
+1. **Command Execution Risk**: The `ask -c` flag and `BAISH_AUTOEXEC=1` setting allow automatic execution of LLM-generated shell commands. This is inherently dangerous:
+   - Compromised or misconfigured LLMs could return malicious commands
+   - LLM hallucinations might produce destructive commands
+   - No sandboxing or validation is performed on returned commands
+
+2. **Recommendations**:
+   - **Never** use `BAISH_AUTOEXEC=1` in production or with untrusted LLMs
+   - Always review commands before execution (default behavior)
+   - Use only with trusted, well-configured LLM endpoints
+   - Consider running in a container or restricted environment when testing
+   - Be especially careful with commands involving `rm`, `dd`, or system modifications
+
+3. **No Command Timeout**: Executed commands have no built-in timeout. LLM-generated infinite loops or long-running commands will block the shell until interrupted (Ctrl+C).
 
 ## Using the LLM
 

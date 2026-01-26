@@ -37,9 +37,11 @@ uninstall:
 
 clean:
 	-$(MAKE) -C "$(BAISH_SRC_DIR)" clean
+	-rm -rf .tmp-*
 
 distclean:
 	-$(MAKE) -C "$(BAISH_SRC_DIR)" distclean
+	-rm -rf .tmp-*
 
 help:
 	@printf "%s\n" \

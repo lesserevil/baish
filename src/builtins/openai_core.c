@@ -24,6 +24,7 @@
 
 #include "openai.h"
 #include "openai_internal.h"
+#include "baish_curl_init.h"
 
 #include <stdarg.h>
 #include <strings.h>
@@ -67,7 +68,8 @@ void openai_init(const char* key) {
     api_key = key ? strdup(key) : NULL;
     if (openai_base_url == NULL)
         openai_base_url = strdup(openai_default_base_url);
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    /* Use shared curl initialization to coordinate with other builtins (mcp) */
+    baish_init_curl_global();
     if (openai_curl_handle == NULL)
         openai_curl_handle = curl_easy_init();
 }
