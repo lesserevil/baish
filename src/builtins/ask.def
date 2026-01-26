@@ -1447,18 +1447,29 @@ baish_handle_preflight_failure (int preflight_result, int preflight_status,
 {
   if (preflight_result == -1)
     {
+      /* Save host and port strings before cleanup frees them (use-after-free fix) */
+      char *host_copy = host ? savestring (host) : NULL;
+      char *port_copy = port ? savestring (port) : NULL;
+
       baish_cleanup_and_exit (question, (char *)host, (char *)port, base_path, path,
                              models_path, models, nmodels, preflight_error,
                              base_urls, nbase_urls, model_candidates, nmodel_candidates);
       if (baish_transport_error[0])
         builtin_error (_("%s: %s"), label, baish_transport_error);
-      else if (host && port)
-        builtin_error (_("%s (cannot reach %s:%s)"), label, host, port);
-      else if (host)
-        builtin_error (_("%s (cannot reach %s)"), label, host);
+      else if (host_copy && port_copy)
+        builtin_error (_("%s (cannot reach %s:%s)"), label, host_copy, port_copy);
+      else if (host_copy)
+        builtin_error (_("%s (cannot reach %s)"), label, host_copy);
       else
         builtin_error (_("%s (cannot reach LLM)"), label);
       baish_print_llm_env_help ();
+
+      /* Free the saved copies */
+      if (host_copy)
+        free (host_copy);
+      if (port_copy)
+        free (port_copy);
+
       return EXECUTION_FAILURE;
     }
 
@@ -1891,6 +1902,52 @@ baish_confirm_exec (int ncmds)
   return (buf[0] == 'y' || buf[0] == 'Y');
 }
 
+/* Read question from command-line arguments or stdin.
+   Returns allocated string that caller must free, or NULL on error. */
+static char *
+baish_read_question_from_args (WORD_LIST *list)
+{
+  char *question;
+
+  if (list)
+    {
+      size_t cap = 0;
+      size_t len = 0;
+      WORD_LIST *t;
+      char *q;
+
+      /* Calculate total length needed */
+      for (t = list; t; t = t->next)
+        cap += strlen (t->word->word) + 1;
+
+      /* Concatenate all arguments with spaces */
+      q = (char *)xmalloc (cap + 1);
+      for (t = list; t; t = t->next)
+        {
+          size_t l = strlen (t->word->word);
+          memcpy (q + len, t->word->word, l);
+          len += l;
+          if (t->next)
+            q[len++] = ' ';
+        }
+      q[len] = '\0';
+      question = q;
+    }
+  else
+    {
+      size_t qlen;
+      question = baish_read_stream_contents (stdin, &qlen);
+      if (qlen == 0)
+        {
+          free (question);
+          builtin_error (_("missing question"));
+          return NULL;
+        }
+    }
+
+  return question;
+}
+
 int
 ask_builtin (WORD_LIST *list)
 {
@@ -2020,38 +2077,9 @@ ask_builtin (WORD_LIST *list)
       return (EXECUTION_FAILURE);
     }
 
-  if (list)
-    {
-      size_t cap = 0;
-      size_t len = 0;
-      WORD_LIST *t;
-      char *q;
-
-      for (t = list; t; t = t->next)
-        cap += strlen (t->word->word) + 1;
-      q = (char *)xmalloc (cap + 1);
-      for (t = list; t; t = t->next)
-        {
-          size_t l = strlen (t->word->word);
-          memcpy (q + len, t->word->word, l);
-          len += l;
-          if (t->next)
-            q[len++] = ' ';
-        }
-      q[len] = '\0';
-      question = q;
-    }
-  else
-    {
-      size_t qlen;
-      question = baish_read_stream_contents (stdin, &qlen);
-      if (qlen == 0)
-        {
-          free (question);
-          builtin_error (_("missing question"));
-          return (EXECUTION_FAILURE);
-        }
-    }
+  question = baish_read_question_from_args (list);
+  if (question == NULL)
+    return (EXECUTION_FAILURE);
 
   base_urls = baish_split_list (base_url, &nbase_urls);
   model_candidates = baish_split_list (model, &nmodel_candidates);
