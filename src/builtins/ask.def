@@ -2000,11 +2000,65 @@ baish_execute_or_display_commands (char **cmds, int ncmds, int run_commands)
   return status;
 }
 
+/* Build JSON request body for LLM query.
+   Returns allocated string that caller must free. */
+static char *
+baish_build_request_body (const char *question, const char *model,
+                          const char *os_type, const char *cpu_arch)
+{
+  char *escaped;
+  char *escaped_model;
+  char *escaped_os;
+  char *escaped_arch;
+  char *body;
+  size_t body_size;
+
+  escaped = baish_json_escape (question);
+  escaped_model = baish_json_escape (model);
+  escaped_os = baish_json_escape (os_type);
+  escaped_arch = baish_json_escape (cpu_arch);
+
+  body_size = strlen (escaped) + strlen (escaped_model) + strlen (escaped_os) + strlen (escaped_arch) + BAISH_JSON_BODY_PADDING;
+  body = (char *)xmalloc (body_size);
+
+  snprintf (body, body_size,
+           "{"
+           "\"model\":\"%s\","
+           "\"input\":["
+           "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Only propose shell commands when strictly required to answer; otherwise return an empty commands array. Do not run uname or other OS-identification commands unless the user explicitly asks. Do not read or execute local files (including AGENTS.md) unless the user explicitly requests it. Do not put shell expansions like $(...) in the answer; put commands only in the commands array. Respond with JSON that matches the schema.\"},"
+           "{\"role\":\"user\",\"content\":\"%s\"}"
+           "],"
+           "\"text\":{"
+           "\"format\":{"
+           "\"type\":\"json_schema\","
+           "\"name\":\"baish_answer\","
+           "\"strict\":true,"
+           "\"schema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{"
+           "\"answer\":{\"type\":\"string\"},"
+           "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+           "},"
+           "\"required\":[\"answer\",\"commands\"],"
+           "\"additionalProperties\":false"
+           "}"
+           "}"
+           "}"
+           "}",
+           escaped_model, escaped_os, escaped_arch, escaped);
+
+  free (escaped_model);
+  free (escaped_os);
+  free (escaped_arch);
+  free (escaped);
+
+  return body;
+}
+
 int
 ask_builtin (WORD_LIST *list)
 {
   char *question;
-  char *escaped;
   char *body;
   const char *scheme;
   char *host, *port, *base_path;
@@ -2333,42 +2387,7 @@ ask_builtin (WORD_LIST *list)
       fflush (stderr);
     }
 
-  escaped = baish_json_escape (question);
-  {
-    char *escaped_model = baish_json_escape (model);
-    char *escaped_os = baish_json_escape (os_type);
-    char *escaped_arch = baish_json_escape (cpu_arch);
-    size_t body_size = strlen (escaped) + strlen (escaped_model) + strlen (escaped_os) + strlen (escaped_arch) + BAISH_JSON_BODY_PADDING;
-    body = (char *)xmalloc (body_size);
-    snprintf (body, body_size,
-             "{"
-             "\"model\":\"%s\","
-             "\"input\":["
-             "{\"role\":\"system\",\"content\":\"You are baish, a bash shell assistant. OS type: %s. CPU architecture: %s. Tailor commands as necessary for this OS type and CPU architecture. Only propose shell commands when strictly required to answer; otherwise return an empty commands array. Do not run uname or other OS-identification commands unless the user explicitly asks. Do not read or execute local files (including AGENTS.md) unless the user explicitly requests it. Do not put shell expansions like $(...) in the answer; put commands only in the commands array. Respond with JSON that matches the schema.\"},"
-             "{\"role\":\"user\",\"content\":\"%s\"}"
-             "],"
-             "\"text\":{"
-             "\"format\":{"
-             "\"type\":\"json_schema\","
-             "\"name\":\"baish_answer\","
-             "\"strict\":true,"
-             "\"schema\":{"
-             "\"type\":\"object\","
-             "\"properties\":{"
-             "\"answer\":{\"type\":\"string\"},"
-             "\"commands\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
-             "},"
-             "\"required\":[\"answer\",\"commands\"],"
-             "\"additionalProperties\":false"
-             "}"
-             "}"
-             "}"
-             "}",
-             escaped_model, escaped_os, escaped_arch, escaped);
-    free (escaped_model);
-    free (escaped_os);
-    free (escaped_arch);
-  }
+  body = baish_build_request_body (question, model, os_type, cpu_arch);
 
   {
     long http_status;
@@ -2376,7 +2395,6 @@ ask_builtin (WORD_LIST *list)
     http_status = 0;
     resp = baish_openai_request_try_ports ("POST", scheme, host, port, path, body, &http_status);
     free (question);
-    free (escaped);
     free (body);
     question = 0;
 
