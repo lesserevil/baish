@@ -1948,6 +1948,58 @@ baish_read_question_from_args (WORD_LIST *list)
   return question;
 }
 
+/* Execute or display commands returned by the LLM.
+   Returns the exit status of the last executed command, or EXECUTION_SUCCESS.
+   Frees the cmds array and its contents. */
+static int
+baish_execute_or_display_commands (char **cmds, int ncmds, int run_commands)
+{
+  int do_exec = 0;
+  int status = EXECUTION_SUCCESS;
+  int i;
+
+  if (ncmds > 0)
+    {
+      if (run_commands)
+        do_exec = 1;
+      else
+        {
+          /* Display commands without executing */
+          int j;
+          for (j = 0; j < ncmds; j++)
+            {
+              if (cmds[j] && *cmds[j])
+                fprintf (stderr, "baish: command[%d]: %s\n", j + 1, cmds[j]);
+            }
+        }
+    }
+
+  if (do_exec)
+    {
+      /* Execute each command */
+      for (i = 0; i < ncmds; i++)
+        {
+          int r;
+          if (cmds[i] && *cmds[i])
+            {
+              r = parse_and_execute (savestring (cmds[i]), "ask", SEVAL_NOHIST|SEVAL_RESETLINE);
+              status = r;
+            }
+        }
+    }
+
+  /* Clean up commands array */
+  if (cmds)
+    {
+      for (i = 0; i < ncmds; i++)
+        if (cmds[i])
+          free (cmds[i]);
+      free (cmds);
+    }
+
+  return status;
+}
+
 int
 ask_builtin (WORD_LIST *list)
 {
@@ -1964,8 +2016,6 @@ ask_builtin (WORD_LIST *list)
   char **cmds;
   int ncmds;
   char *joined;
-  int i;
-  int do_exec;
   int status;
   int run_commands;
   int explicit_run_commands;
@@ -2523,43 +2573,7 @@ ask_builtin (WORD_LIST *list)
       fflush (stdout);
     }
 
-  do_exec = 0;
-  if (ncmds > 0)
-    {
-      if (run_commands)
-        do_exec = 1;
-      else
-        {
-          int j;
-          for (j = 0; j < ncmds; j++)
-            {
-              if (cmds[j] && *cmds[j])
-                fprintf (stderr, "baish: command[%d]: %s\n", j + 1, cmds[j]);
-            }
-        }
-    }
-
-  status = EXECUTION_SUCCESS;
-  if (do_exec)
-    {
-      for (i = 0; i < ncmds; i++)
-        {
-          int r;
-          if (cmds[i] && *cmds[i])
-            {
-              r = parse_and_execute (savestring (cmds[i]), "ask", SEVAL_NOHIST|SEVAL_RESETLINE);
-              status = r;
-            }
-        }
-    }
-
-  if (cmds)
-    {
-      for (i = 0; i < ncmds; i++)
-        if (cmds[i])
-          free (cmds[i]);
-      free (cmds);
-    }
+  status = baish_execute_or_display_commands (cmds, ncmds, run_commands);
   free (joined);
   free (answer);
 
